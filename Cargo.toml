@@ -1,0 +1,16 @@
+[package]
+name = "gaia"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+axum = { version = "0.7.5", features = ["multipart", "tokio", "macros"] }
+dotenvy = "0.15.7"
+geoutils = "0.5.1"
+serde = { version = "1.0.203", features = ["derive"] }
+serde_json = "1.0.118"
+sqlx = { version = "0.7.4", features = ["runtime-tokio", "sqlite"] }
+tokio = { version = "1.38.0", features = ["full"] }
+tracing = "0.1.40"
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+ureq = {version = "2.9.7", features = ["json"] }
