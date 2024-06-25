@@ -138,7 +138,7 @@ async fn post_geo_reverse_bulk(
         response.push(geo_reverse(req.lat, req.lon, pool.clone()).await.unwrap())
     }
 
-    (StatusCode::OK, Json(response))
+    (StatusCode::OK, Json(response.into_iter().flatten().collect::<Vec<_>>()))
 }
 
 async fn geo_reverse(
@@ -155,8 +155,8 @@ async fn geo_reverse(
             .unwrap()
             .into_iter()
             .map(|g| GeocodeResponse {
-                lat: g.lat.clone(),
-                lon: g.lon.clone(),
+                lat: lat.clone(),
+                lon: lon.clone(),
                 address: g.address.0.clone(),
                 distance: Location::new(g.address.latitude.unwrap(), g.address.longitude.unwrap())
                     .distance_to(&Location::new(
