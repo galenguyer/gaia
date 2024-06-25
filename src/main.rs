@@ -1,7 +1,11 @@
 use std::{collections::HashMap, env, net::SocketAddr, sync::Arc};
 
 use axum::{
-    extract::Query, http::StatusCode, response::IntoResponse, routing::get, Extension, Json, Router,
+    extract::Query,
+    http::StatusCode,
+    response::IntoResponse,
+    routing::{get, post},
+    Extension, Json, Router,
 };
 use geoutils::Location;
 use serde::{Deserialize, Serialize};
@@ -42,7 +46,9 @@ async fn main() {
             "/api",
             Router::new().nest(
                 "/v0",
-                Router::new().route("/geocode/reverse", get(geo_reverse)),
+                Router::new()
+                    .route("/geocode/reverse", get(get_geo_reverse))
+                    .route("/geocode/reverse/bulk", post(post_geo_reverse_bulk)),
             ),
         )
         .layer(Extension(sqlite_pool));
@@ -59,9 +65,16 @@ async fn main() {
 pub struct Geocode {
     pub lat: String,
     pub lon: String,
-    #[sqlx(skip)]
-    pub distance: f64,
     pub address: sqlx::types::Json<RadarAddress>,
+}
+
+#[derive(Serialize, Deserialize, FromRow, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct GeocodeResponse {
+    pub lat: String,
+    pub lon: String,
+    pub distance: f64,
+    pub address: RadarAddress,
 }
 
 #[derive(Serialize, Deserialize, FromRow, Debug, Default)]
@@ -89,53 +102,81 @@ pub struct RadarAddress {
     street: Option<String>,
 }
 
-async fn geo_reverse(
+async fn get_geo_reverse(
     Query(params): Query<HashMap<String, String>>,
     Extension(pool): Extension<Arc<Pool<Sqlite>>>,
 ) -> impl IntoResponse {
-    let lat_query = match params.get("lat") {
+    let lat = match params.get("lat") {
         Some(lat) => format!("{:.5}", lat.parse::<f64>().unwrap()),
         None => return (StatusCode::BAD_REQUEST, Json(json!("missing lat"))).into_response(),
     };
-    let lon_query = match params.get("lon") {
+    let lon = match params.get("lon") {
         Some(lon) => format!("{:.5}", lon.parse::<f64>().unwrap()),
         None => return (StatusCode::BAD_REQUEST, Json(json!("missing lon"))).into_response(),
     };
 
+    return (
+        StatusCode::OK,
+        Json(geo_reverse(lat, lon, pool).await.unwrap()),
+    )
+        .into_response();
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BulkGeocodeReverseRequest {
+    pub lat: String,
+    pub lon: String,
+}
+
+async fn post_geo_reverse_bulk(
+    Extension(pool): Extension<Arc<Pool<Sqlite>>>,
+    Json(data): Json<Vec<BulkGeocodeReverseRequest>>,
+) -> impl IntoResponse {
+    let mut response = vec![];
+    for req in data {
+        response.push(geo_reverse(req.lat, req.lon, pool.clone()).await.unwrap())
+    }
+
+    (StatusCode::OK, Json(response))
+}
+
+async fn geo_reverse(
+    lat: String,
+    lon: String,
+    pool: Arc<Pool<Sqlite>>,
+) -> Result<Vec<GeocodeResponse>, String> {
     let geocodes =
         sqlx::query_as::<_, Geocode>("SELECT * FROM geocode WHERE lat LIKE ? AND lon LIKE ?")
-            .bind(format!("{:.4}%", lat_query))
-            .bind(format!("{:.4}%", lon_query))
+            .bind(format!("{:.4}%", lat))
+            .bind(format!("{:.4}%", lon))
             .fetch_all(&*pool)
             .await
             .unwrap()
             .into_iter()
-            .map(|g| Geocode {
+            .map(|g| GeocodeResponse {
                 lat: g.lat.clone(),
                 lon: g.lon.clone(),
-                address: g.address.clone(),
-                distance: Location::new(
-                    g.address.latitude.unwrap(),
-                    g.address.longitude.unwrap(),
-                )
-                .distance_to(&Location::new(
-                    lat_query.parse::<f64>().unwrap(),
-                    lon_query.parse::<f64>().unwrap(),
-                ))
-                .unwrap()
-                .meters(),
+                address: g.address.0.clone(),
+                distance: Location::new(g.address.latitude.unwrap(), g.address.longitude.unwrap())
+                    .distance_to(&Location::new(
+                        lat.parse::<f64>().unwrap(),
+                        lon.parse::<f64>().unwrap(),
+                    ))
+                    .unwrap()
+                    .meters(),
             })
-            .filter(|g| g.distance < 40.0 || (g.lat == lat_query && g.lon == lon_query))
+            .filter(|g| g.distance < 40.0 || (g.lat == lat && g.lon == lon))
             .collect::<Vec<_>>();
 
     if geocodes.len() > 0 {
         tracing::info!("got from cache");
-        return (StatusCode::OK, Json(json!(geocodes))).into_response();
+        return Ok(geocodes);
     }
 
     let response: RadarReverseGeocodeResponse = ureq::get(&format!(
         "https://api.radar.io/v1/geocode/reverse?coordinates={},{}",
-        lat_query, lon_query
+        lat, lon
     ))
     .set(
         "Authorization",
@@ -148,30 +189,28 @@ async fn geo_reverse(
 
     for address in response.addresses.iter() {
         sqlx::query("INSERT INTO geocode(lat,lon,address) VALUES (?, ?, ?)")
-            .bind(&lat_query)
-            .bind(&lon_query)
+            .bind(&lat)
+            .bind(&lon)
             .bind(json!(address))
             .execute(&*pool)
             .await
             .unwrap();
     }
 
-    return (
-        StatusCode::OK,
-        Json(json!(response
-            .addresses
-            .iter()
-            .map(|a| {
-                json!({
-                    "lat": lat_query,
-                    "lon": lon_query,
-                    "address": a,
-                    "distance": Location::new(a.latitude.unwrap(), a.longitude.unwrap())
-                    .distance_to(&Location::new(lat_query.parse::<f64>().unwrap(), lon_query.parse::<f64>().unwrap()))
-                    .unwrap().meters()
-                })
-            })
-            .collect::<Vec<_>>())),
-    )
-        .into_response();
+    return Ok(response
+        .addresses
+        .iter()
+        .map(|a| GeocodeResponse {
+            lat: lat.clone(),
+            lon: lon.clone(),
+            address: a.clone(),
+            distance: Location::new(a.latitude.unwrap(), a.longitude.unwrap())
+                .distance_to(&Location::new(
+                    lat.parse::<f64>().unwrap(),
+                    lon.parse::<f64>().unwrap(),
+                ))
+                .unwrap()
+                .meters(),
+        })
+        .collect::<Vec<_>>());
 }
