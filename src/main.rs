@@ -166,7 +166,7 @@ async fn geo_reverse(
                     .unwrap()
                     .meters(),
             })
-            .filter(|g| g.distance < 40.0 || (g.lat == lat && g.lon == lon))
+            .filter(|g| g.distance < 40.0)
             .collect::<Vec<_>>();
 
     if geocodes.len() > 0 {
